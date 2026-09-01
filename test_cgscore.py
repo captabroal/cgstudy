@@ -30,21 +30,21 @@ for label, dens in [
     ("uniform", S.uniform_density(Y)),
     ("nearspot", S.nearspot_density(Y, SPOT, ATR, 8.0)),
 ]:
-    d, edges, cell = dens
-    check(f"{label} density integrates to 1", abs(d.sum() * cell - 1) < 1e-9,
-          f"{d.sum()*cell:.12f}")
+    lp, edges, w = dens
+    check(f"{label} density integrates to 1", abs((np.exp(lp)*w).sum() - 1) < 1e-9,
+          f"{(np.exp(lp)*w).sum():.12f}")
 
 # 2. THE CRITICAL TEST — feeding the null in as the map must return exactly zero.
 #    Any non-zero here means a normalisation or support mismatch.
-p_ns, edges, cell = S.nearspot_density(Y, SPOT, ATR, 8.0)
-ev = rng.choice(Y, size=4000, p=p_ns * cell)
-r = S.score_window(p_ns * cell, Y, ev, SPOT, ATR, k=8.0, eps=0.0)
+lp_ns, edges, w = S.nearspot_density(Y, SPOT, ATR, 8.0)
+ev = rng.choice(Y, size=4000, p=np.exp(lp_ns)*w)
+r = S.score_window(np.exp(lp_ns)*w, Y, ev, SPOT, ATR, k=8.0, eps=0.0)
 check("null-as-map gives zero gain vs nearspot", abs(r["nll_gain_vs_nearspot"]) < 1e-9,
       f"{r['nll_gain_vs_nearspot']:.2e}")
 
 # 3. Uniform-as-map vs uniform null must also be exactly zero.
-p_u, _, cell_u = S.uniform_density(Y)
-r = S.score_window(p_u * cell_u, Y, ev, SPOT, ATR, k=8.0, eps=0.0)
+lp_u, _, w_u = S.uniform_density(Y)
+r = S.score_window(np.exp(lp_u)*w_u, Y, ev, SPOT, ATR, k=8.0, eps=0.0)
 check("uniform-as-map gives zero gain vs uniform", abs(r["nll_gain_vs_uniform"]) < 1e-9,
       f"{r['nll_gain_vs_uniform']:.2e}")
 
@@ -83,36 +83,37 @@ check("sharp_lift ~1.0 on uniform map", abs(r["sharp_lift"] - 1.0) < 0.10,
 #    density must give sharp_lift == 1.0 exactly (perfect calibration), and
 #    only an UNDER-CONFIDENT map exceeds 1.0.
 peak = np.exp(-0.5 * ((np.arange(134) - 67) / 12.0) ** 2)
-p_peak, e_peak, c_peak = S.build_density(peak, Y, eps=0.0)
-ev_cal = rng.choice(Y, size=40000, p=p_peak * c_peak)
+lp_peak, e_peak, w_peak = S.build_density(peak, Y, eps=0.0)
+ev_cal = rng.choice(Y, size=40000, p=np.exp(lp_peak)*w_peak)
 r = S.score_window(peak, Y, ev_cal, SPOT, ATR, eps=0.0)
 check("sharp_lift == 1.0 when map is perfectly calibrated",
       abs(r["sharp_lift"] - 1.0) < 0.05, f"{r['sharp_lift']:.3f}")
 
 sharper = np.exp(-0.5 * ((np.arange(134) - 67) / 4.0) ** 2)
-p_sh, e_sh, c_sh = S.build_density(sharper, Y, eps=0.0)
-ev_sharp = rng.choice(Y, size=40000, p=p_sh * c_sh)
+lp_sh, e_sh, w_sh = S.build_density(sharper, Y, eps=0.0)
+ev_sharp = rng.choice(Y, size=40000, p=np.exp(lp_sh)*w_sh)
 r = S.score_window(peak, Y, ev_sharp, SPOT, ATR, eps=0.0)
 check("sharp_lift > 1.5 when map is under-confident", r["sharp_lift"] > 1.5,
       f"{r['sharp_lift']:.3f}")
 
 flatter = np.exp(-0.5 * ((np.arange(134) - 67) / 40.0) ** 2)
-p_fl, e_fl, c_fl = S.build_density(flatter, Y, eps=0.0)
-ev_flat = rng.choice(Y, size=40000, p=p_fl * c_fl)
+lp_fl, e_fl, w_fl = S.build_density(flatter, Y, eps=0.0)
+ev_flat = rng.choice(Y, size=40000, p=np.exp(lp_fl)*w_fl)
 r = S.score_window(peak, Y, ev_flat, SPOT, ATR, eps=0.0)
 check("sharp_lift < 1.0 when map is over-confident", r["sharp_lift"] < 1.0,
       f"{r['sharp_lift']:.3f}")
 
 # 10. Truncated Laplace: a tighter k concentrates coverage.
 c_tight = S.coverage(*S.nearspot_density(Y, SPOT, ATR, 2.0)[::2])
-c_wide = S.coverage(*S.nearspot_density(Y, SPOT, ATR, 40.0)[::2])
+c_wide  = S.coverage(*S.nearspot_density(Y, SPOT, ATR, 40.0)[::2])
 check("tighter k gives lower coverage", c_tight < c_wide, f"{c_tight:.3f} < {c_wide:.3f}")
 
-# 11. profile_max_k recovers the k that generated the events.
-p_true, e_true, c_true = S.nearspot_density(Y, SPOT, ATR, 6.0)
-ev_k = rng.choice(Y, size=20000, p=p_true * c_true)
-khat, _ = S.profile_max_k(None, Y, ev_k, SPOT, ATR)
-check("profile_max_k recovers true k", abs(khat - 6.0) / 6.0 < 0.25, f"khat={khat:.2f} true=6.0")
+# 11. profile_max_scale recovers the scale that generated the events.
+lp_true, e_true, w_true = S.nearspot_density(Y, SPOT, ATR, 6.0)
+ev_k = rng.choice(Y, size=20000, p=np.exp(lp_true)*w_true)
+shat, _ = S.profile_max_scale(Y, ev_k, SPOT)
+check("profile_max_scale recovers true scale", abs(shat - 6.0*ATR)/(6.0*ATR) < 0.25,
+      f"shat={shat:.0f} true={6.0*ATR:.0f}")
 
 # 12. Power arithmetic matches the pre-registration.
 check("required_n(sd=0.50, effect=0.10) ~ 96-100", 90 <= S.required_n(0.50, 0.10) <= 105,
@@ -146,7 +147,52 @@ p_real, pos, tot = S.sign_test(np.random.default_rng(7).normal(1.0, 1.0, 200))
 check("sign test false-positive rate ~5%", 0.01 <= fp_rate <= 0.11, f"{fp_rate:.1%}")
 check("sign test detects a real shift", p_real < 0.01, f"p={p_real:.2e} ({pos}/{tot} positive)")
 
-# 15. BH controls: all-null p-values yield few rejections.
+# 15. NON-UNIFORM AXIS (model2 12h/24h/1mo return these; the old scorer refused).
+Ynu = np.sort(np.concatenate([np.linspace(74000, 78000, 60),
+                              np.linspace(78050, 82000, 100)]))
+e_nu, w_nu = S.bin_edges(Ynu)
+check("non-uniform axis accepted", w_nu.size == Ynu.size and w_nu.std() > 0,
+      f"n={w_nu.size} width sd={w_nu.std():.2f}")
+lp_nu, e2, w2 = S.build_density(rng.random(Ynu.size), Ynu)
+check("non-uniform map density integrates to 1", abs((np.exp(lp_nu)*w2).sum()-1) < 1e-9,
+      f"{(np.exp(lp_nu)*w2).sum():.12f}")
+lp_nl, e3, w3 = S.laplace_density(Ynu, 78000.0, 400.0)
+check("non-uniform Laplace integrates to 1", abs((np.exp(lp_nl)*w3).sum()-1) < 1e-9,
+      f"{(np.exp(lp_nl)*w3).sum():.12f}")
+
+# 16. UNDERFLOW SAFETY. A tight scale over a wide support underflowed to zero in
+#     linear space (model2/3mo divide-by-zero). Log space must stay finite.
+lp_tiny, e_t, w_t = S.laplace_density(Y, SPOT, 1.0)
+check("tight Laplace stays finite in log space",
+      np.all(np.isfinite(lp_tiny)) and abs((np.exp(lp_tiny)*w_t).sum()-1) < 1e-9,
+      f"min logp={lp_tiny.min():.1f}")
+
+# 17. MA-CENTRED NULL (AMENDMENT 1). Feeding it in as the map must give zero.
+MA = SPOT * 1.0127                      # +1.27%, the measured 24h offset
+lp_ma, e_ma, w_ma = S.ma_density(Y, MA, 8.0*ATR)
+ev_ma = rng.choice(Y, size=6000, p=np.exp(lp_ma)*w_ma)
+r = S.score_window(np.exp(lp_ma)*w_ma, Y, ev_ma, SPOT, ATR, k=8.0, eps=0.0,
+                   window_mean=MA)
+check("MA-null-as-map gives zero gain vs MA null", abs(r["nll_gain_vs_ma"]) < 1e-9,
+      f"{r['nll_gain_vs_ma']:.2e}")
+
+# 18. THE DECISIVE PROPERTY. A map centred on the window mean must BEAT the
+#     spot-centred null while TYING the MA-centred null. That gap is exactly the
+#     credit a spot-centred null hands to a moving average.
+check("MA-centred map beats near-spot but ties MA null",
+      r["nll_gain_vs_nearspot"] > 0.05 and abs(r["nll_gain_vs_ma"]) < 1e-9,
+      f"vs_ns={r['nll_gain_vs_nearspot']:+.4f} vs_ma={r['nll_gain_vs_ma']:+.2e}")
+
+# 19. Normalised KL is comparable across grids of different size.
+fine = np.linspace(Y[0], Y[-1], 391)
+sig = (Y[-1]-Y[0])/12
+gc = lambda ax: np.exp(-0.5*((ax-SPOT)/sig)**2)
+n_coarse = S.normalised_kl_uniform(*S.build_density(gc(Y), Y, eps=0.0)[::2])
+n_fine   = S.normalised_kl_uniform(*S.build_density(gc(fine), fine, eps=0.0)[::2])
+check("normalised KL comparable across 134 vs 391 bins",
+      abs(n_coarse - n_fine) < 0.05, f"coarse={n_coarse:.4f} fine={n_fine:.4f}")
+
+# 20. BH controls: all-null p-values yield few rejections.
 rej = S.benjamini_hochberg(rng.uniform(0, 1, 71), q=0.10)
 check("BH rejects few under the null", rej.sum() <= 3, f"{int(rej.sum())}/71 rejected")
 
