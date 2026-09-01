@@ -1,0 +1,9 @@
+# NEVER commit the Apify token or captured data.
+.token
+*.token
+snapshots/
+smoke/
+capture.log
+manifest.csv
+__pycache__/
+*.pyc
