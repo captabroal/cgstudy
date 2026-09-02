@@ -2,10 +2,9 @@
 """
 cg_asym.py - does the heatmap's long/short imbalance predict DIRECTION?
 
-Direction is a sign test, so it needs far fewer windows than density scoring
-and may report earlier. It is also tradeable even though the map's centre of
-mass is a moving average (Amendment 1), because a directional call does not
-depend on locating a level.
+Direction is a sign test, so it needs far fewer windows than density scoring.
+It is also tradeable even though the map's centre of mass is a moving average
+(Amendment 1), because a directional call does not depend on locating a level.
 
 THE TRAP THIS SCRIPT EXISTS TO AVOID
 ------------------------------------
@@ -22,20 +21,26 @@ average", a mean-reversion signal anyone can compute for free.
 If RAW predicts and RESIDUAL does not, the signal is mean reversion and
 CoinGlass adds nothing. Only RESIDUAL skill is evidence of a real edge.
 
-TWO STATISTICAL FIXES (2026-09-02, after the first live run misreported)
-------------------------------------------------------------------------
+STATISTICAL FIXES
+-----------------
+2026-09-02a
 1. NON-OVERLAP. Snapshots are 6h apart, so at a 12h horizon adjacent windows
-   share 6h of price path and are NOT independent. The first version scored
-   all of them and reported "0/6, p=0.031, INVERTED". Thinned to
-   non-overlapping windows that is 0/3, exact CI [0%, 70.8%] -- no finding at
-   all. Windows are now thinned greedily to >= horizon apart, and both counts
-   are printed so the cost of thinning is visible.
-
-2. EXACT BINOMIAL CI. A percentile bootstrap on a handful of binary points is
+   share 6h of price path and are NOT independent. The first live run scored
+   all of them and reported "0/6, p=0.031, INVERTED". Thinned that is 0/3,
+   exact CI [0%, 70.8%] -- no finding at all.
+2. EXACT BINOMIAL CI. Percentile bootstrap on a few binary points is
    unreliable, and on an all-identical sample returns a ZERO-WIDTH interval
-   ([0.0%, 0.0%]) which reads as certainty but is degeneracy -- resampling
-   cannot move a constant. Clopper-Pearson is exact at any n.
-   (Belongs in cgscore.py eventually; kept local for now.)
+   that reads as certainty but is degeneracy. Clopper-Pearson is exact.
+
+2026-09-02b
+3. GAP TOLERANCE. updateTime is CoinGlass's stamp, not the cron clock, so real
+   6h gaps land either side of the mark -- measured 6.0023h, 6.0089h, 5.9894h.
+   A strict >= horizon test discarded the 5.9894h window over 38 seconds of
+   jitter, silently halving the sample and doubling every timeline. Tolerance
+   is now 300s.
+4. EXCLUDE _sweep DIRECTORIES. The one-off structural sweep and the manual
+   --tier primary tests sit minutes apart and are not part of the scheduled
+   forward series; mixing them in made the cadence look irregular.
 
 Usage:
     python3 cg_asym.py --coin BTC --model model1 --interval 24h --all-horizons
@@ -54,8 +59,9 @@ HOURS = {"12h": 12, "24h": 24, "48h": 48, "3d": 72,
          "1w": 168, "2w": 336, "1mo": 720, "3mo": 2160}
 PAIR = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
 
-N_SCREEN = 30      # pre-registered screening n
-N_CONFIRM = 100    # pre-registered confirmation n
+N_SCREEN = 30       # pre-registered screening n
+N_CONFIRM = 100     # pre-registered confirmation n
+TOL_SEC = 300       # gap tolerance: jitter must not cost a window
 
 
 def exact_binomial_ci(successes, trials, alpha=0.05):
@@ -106,11 +112,12 @@ def asym_of(logp, widths, y, spot):
     return float((above - below) / tot) if tot > 0 else np.nan
 
 
-def thin_nonoverlapping(rows, horizon_h):
-    """Greedy: keep windows at least one horizon apart, earliest first."""
+def thin_nonoverlapping(rows, horizon_h, tol_sec=TOL_SEC):
+    """Greedy: keep windows at least one horizon apart, minus a jitter allowance."""
+    need = horizon_h * 3600_000 - tol_sec * 1000
     kept, last = [], -np.inf
     for r in sorted(rows, key=lambda x: x["ut"]):
-        if r["ut"] - last >= horizon_h * 3600_000:
+        if r["ut"] - last >= need:
             kept.append(r)
             last = r["ut"]
     return kept
@@ -150,10 +157,14 @@ def main():
     ap.add_argument("--horizon", type=float, default=6.0)
     ap.add_argument("--all-horizons", action="store_true")
     ap.add_argument("--snapdir", default="./snapshots")
+    ap.add_argument("--include-adhoc", action="store_true",
+                    help="include _sweep and manual pulls (not the scheduled series)")
     args = ap.parse_args()
 
     pat = os.path.join(args.snapdir, "*", f"{args.coin}_{args.model}_{args.interval}.json")
     files = sorted(glob.glob(pat))
+    if not args.include_adhoc:
+        files = [f for f in files if "_sweep" not in os.path.basename(os.path.dirname(f))]
     if not files:
         sys.exit(f"no snapshots matching {pat}")
 
