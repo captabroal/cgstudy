@@ -2,32 +2,42 @@
 """
 cg_asym.py - does the heatmap's long/short imbalance predict DIRECTION?
 
-This is the highest-value remaining test and the cheapest to run. Density
-scoring asks "where will liquidations land" and needs ~100 windows. Direction
-is a sign test: it needs far fewer, so it may report at the n=15 pilot rather
-than late September. And if it works it is tradeable even though the map's
-centre of mass is a moving average (Amendment 1), because a directional signal
-does not depend on locating a level.
+Direction is a sign test, so it needs far fewer windows than density scoring
+and may report earlier. It is also tradeable even though the map's centre of
+mass is a moving average (Amendment 1), because a directional call does not
+depend on locating a level.
 
 THE TRAP THIS SCRIPT EXISTS TO AVOID
 ------------------------------------
 Raw asymmetry is contaminated by construction. The map centres on the window
 mean, so whenever spot sits BELOW that mean, more mass mechanically sits above
-spot and asymmetry prints positive -- with no liquidation information involved
-at all. Raw asymmetry is therefore largely a restatement of "spot vs its own
-moving average", i.e. a mean-reversion signal anyone can compute for free.
-
-So two quantities are scored separately:
+spot and asymmetry prints positive -- with no liquidation information involved.
+Raw asymmetry is therefore largely a restatement of "spot vs its own moving
+average", a mean-reversion signal anyone can compute for free.
 
   raw       = (mass above spot - mass below spot) / total
-  expected  = the same statistic computed on the MA-CENTRED NULL alone
+  expected  = the same statistic on the MA-CENTRED NULL alone
   residual  = raw - expected
 
 If RAW predicts and RESIDUAL does not, the signal is mean reversion and
 CoinGlass adds nothing. Only RESIDUAL skill is evidence of a real edge.
 
+TWO STATISTICAL FIXES (2026-09-02, after the first live run misreported)
+------------------------------------------------------------------------
+1. NON-OVERLAP. Snapshots are 6h apart, so at a 12h horizon adjacent windows
+   share 6h of price path and are NOT independent. The first version scored
+   all of them and reported "0/6, p=0.031, INVERTED". Thinned to
+   non-overlapping windows that is 0/3, exact CI [0%, 70.8%] -- no finding at
+   all. Windows are now thinned greedily to >= horizon apart, and both counts
+   are printed so the cost of thinning is visible.
+
+2. EXACT BINOMIAL CI. A percentile bootstrap on a handful of binary points is
+   unreliable, and on an all-identical sample returns a ZERO-WIDTH interval
+   ([0.0%, 0.0%]) which reads as certainty but is degeneracy -- resampling
+   cannot move a constant. Clopper-Pearson is exact at any n.
+   (Belongs in cgscore.py eventually; kept local for now.)
+
 Usage:
-    python3 cg_asym.py --coin BTC --model model1 --interval 24h --horizon 6
     python3 cg_asym.py --coin BTC --model model1 --interval 24h --all-horizons
 """
 
@@ -44,6 +54,19 @@ HOURS = {"12h": 12, "24h": 24, "48h": 48, "3d": 72,
          "1w": 168, "2w": 336, "1mo": 720, "3mo": 2160}
 PAIR = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
 
+N_SCREEN = 30      # pre-registered screening n
+N_CONFIRM = 100    # pre-registered confirmation n
+
+
+def exact_binomial_ci(successes, trials, alpha=0.05):
+    """Clopper-Pearson interval. Exact at any n, including 0/n and n/n."""
+    from scipy.stats import beta
+    if trials == 0:
+        return float("nan"), float("nan")
+    lo = 0.0 if successes == 0 else beta.ppf(alpha / 2, successes, trials - successes + 1)
+    hi = 1.0 if successes == trials else beta.ppf(1 - alpha / 2, successes + 1, trials - successes)
+    return float(lo), float(hi)
+
 
 def klines(symbol, interval, start_ms, end_ms, limit=1000):
     url = (f"{KL}?symbol={symbol}&interval={interval}"
@@ -53,7 +76,6 @@ def klines(symbol, interval, start_ms, end_ms, limit=1000):
 
 
 def price_series(symbol, t0_ms, t1_ms):
-    """Hourly closes spanning [t0, t1], paged."""
     out, cur = [], t0_ms
     while cur < t1_ms:
         batch = klines(symbol, "1h", cur, t1_ms)
@@ -71,7 +93,6 @@ def price_series(symbol, t0_ms, t1_ms):
 
 
 def at(series, ts_ms):
-    """Close of the last bar at or before ts_ms."""
     if series.size == 0:
         return None
     i = np.searchsorted(series[:, 0], ts_ms, side="right") - 1
@@ -79,12 +100,46 @@ def at(series, ts_ms):
 
 
 def asym_of(logp, widths, y, spot):
-    """(mass above spot - mass below) / total, for any log-density."""
     mass = np.exp(logp) * widths
-    above = mass[y > spot].sum()
-    below = mass[y < spot].sum()
+    above, below = mass[y > spot].sum(), mass[y < spot].sum()
     tot = above + below
     return float((above - below) / tot) if tot > 0 else np.nan
+
+
+def thin_nonoverlapping(rows, horizon_h):
+    """Greedy: keep windows at least one horizon apart, earliest first."""
+    kept, last = [], -np.inf
+    for r in sorted(rows, key=lambda x: x["ut"]):
+        if r["ut"] - last >= horizon_h * 3600_000:
+            kept.append(r)
+            last = r["ut"]
+    return kept
+
+
+def report(label, a, ret):
+    ok = np.isfinite(a) & np.isfinite(ret) & (a != 0) & (ret != 0)
+    print(f"\n  {label}")
+    if ok.sum() < 5:
+        print(f"    only {int(ok.sum())} usable points - nothing to report")
+        return
+    agree = np.sign(a[ok]) == np.sign(ret[ok])
+    k, n = int(agree.sum()), int(ok.sum())
+    p, _, _ = S.sign_test(np.where(agree, 1.0, -1.0))
+    lo, hi = exact_binomial_ci(k, n)
+    rho = float(np.corrcoef(a[ok], ret[ok])[0, 1])
+    print(f"    independent n    : {n}")
+    print(f"    direction hit    : {k}/{n} = {k/n*100:.1f}%   exact 95% CI "
+          f"[{lo*100:.1f}%, {hi*100:.1f}%]")
+    print(f"    sign test p      : {p:.4f}")
+    print(f"    corr with return : {rho:+.4f}")
+    if n < N_SCREEN:
+        print(f"    => UNDERPOWERED (n={n} < {N_SCREEN}). Not a result at any p-value.")
+    elif lo > 0.5:
+        print("    => directional skill; exact CI excludes a coin flip")
+    elif hi < 0.5:
+        print("    => INVERTED; fading this beat following it")
+    else:
+        print("    => not distinguishable from a coin flip")
 
 
 def main():
@@ -92,7 +147,7 @@ def main():
     ap.add_argument("--coin", default="BTC")
     ap.add_argument("--model", default="model1")
     ap.add_argument("--interval", default="24h")
-    ap.add_argument("--horizon", type=float, default=6.0, help="hours")
+    ap.add_argument("--horizon", type=float, default=6.0)
     ap.add_argument("--all-horizons", action="store_true")
     ap.add_argument("--snapdir", default="./snapshots")
     args = ap.parse_args()
@@ -106,8 +161,6 @@ def main():
     lookback_h = HOURS.get(args.interval, 24)
     sym = PAIR.get(args.coin, args.coin + "USDT")
 
-    # Parse every snapshot first, then fetch one price series covering all of
-    # them plus the longest lookback and horizon.
     snaps = []
     for f in files:
         try:
@@ -137,61 +190,39 @@ def main():
             spot = at(px, s["ut"])
             fwd = at(px, s["ut"] + H * 3600_000)
             if spot is None or fwd is None or s["ut"] + H * 3600_000 > px[-1, 0]:
-                continue    # horizon has not matured yet
+                continue
             win = px[(px[:, 0] >= s["ut"] - lookback_h * 3600_000) & (px[:, 0] <= s["ut"])]
             if win.shape[0] < 3:
                 continue
             wmean = float(win[:, 1].mean())
-
             lp, edges, widths = S.build_density(s["prof"], s["y"])
             raw = asym_of(lp, widths, s["y"], spot)
-            # Expected asymmetry from the MA-centred null ALONE. Scale is set to
-            # the map's own dispersion so the null is a like-for-like stand-in.
             mass = np.exp(lp) * widths
             com = float((mass * s["y"]).sum())
             sd = float(np.sqrt((mass * (s["y"] - com) ** 2).sum()))
             lp_ma, _, w_ma = S.ma_density(s["y"], wmean, max(sd / np.sqrt(2), 1e-6))
             exp = asym_of(lp_ma, w_ma, s["y"], spot)
+            rows.append({"ut": s["ut"], "ret": (fwd / spot - 1) * 100,
+                         "raw": raw, "res": raw - exp})
 
-            rows.append({"ut": s["ut"], "spot": spot,
-                         "ret": (fwd / spot - 1) * 100,
-                         "raw": raw, "exp": exp, "res": raw - exp})
-
-        print(f"\n{'='*62}\nHORIZON {H:g}h  -  {args.coin}/{args.model}/{args.interval}\n{'='*62}")
+        n_all = len(rows)
+        rows = thin_nonoverlapping(rows, H)
+        print(f"\n{'='*64}\nHORIZON {H:g}h  -  {args.coin}/{args.model}/{args.interval}\n{'='*64}")
+        print(f"  matured windows {n_all} -> {len(rows)} after non-overlap thinning")
         if len(rows) < 5:
-            print(f"  {len(rows)} matured windows. Need >=5 to report, >=30 for a")
-            print("  screening verdict. Capture is still accumulating.")
+            need_d = (N_SCREEN - len(rows)) * H / 24.0
+            print(f"  Too few to report. Screening needs {N_SCREEN} (~{need_d:.0f} more days).")
             continue
-
         ret = np.array([r["ret"] for r in rows])
-        for label, key in (("RAW  (contaminated by mean reversion)", "raw"),
-                           ("RESIDUAL (the only honest one)", "res")):
-            a = np.array([r[key] for r in rows])
-            ok = np.isfinite(a) & np.isfinite(ret) & (a != 0) & (ret != 0)
-            if ok.sum() < 5:
-                print(f"\n  {label}: too few usable points")
-                continue
-            agree = np.sign(a[ok]) == np.sign(ret[ok])
-            p, pos, tot = S.sign_test(np.where(agree, 1.0, -1.0))
-            rho = float(np.corrcoef(a[ok], ret[ok])[0, 1])
-            mu, lo, hi, n = S.bootstrap_ci(np.where(agree, 1.0, 0.0))
-            print(f"\n  {label}")
-            print(f"    n windows        : {int(ok.sum())}")
-            print(f"    direction hit    : {agree.mean()*100:.1f}%  "
-                  f"95% CI [{lo*100:.1f}%, {hi*100:.1f}%]")
-            print(f"    sign test p      : {p:.4f}  ({pos}/{tot} agree)")
-            print(f"    corr with return : {rho:+.4f}")
-            if lo > 0.5:
-                print("    => directional skill, CI excludes coin-flip")
-            elif hi < 0.5:
-                print("    => INVERTED: fading this signal beat following it")
-            else:
-                print("    => not distinguishable from a coin flip at this n")
-
-        print("\n  READ THIS BEFORE ACTING: if RAW shows skill and RESIDUAL does")
-        print("  not, the signal is spot-versus-its-own-moving-average. That is")
-        print("  free, public, and owes nothing to CoinGlass. Only RESIDUAL")
-        print("  skill is evidence of an edge in the liquidation data itself.")
+        report("RAW  (contaminated by mean reversion)",
+               np.array([r["raw"] for r in rows]), ret)
+        report("RESIDUAL (the only honest one)",
+               np.array([r["res"] for r in rows]), ret)
+        print(f"\n  Thresholds: {N_SCREEN} independent windows to screen, "
+              f"{N_CONFIRM} to move sizing.")
+        print("  If RAW shows skill and RESIDUAL does not, the signal is")
+        print("  spot-versus-its-own-moving-average: free, public, and owing")
+        print("  nothing to CoinGlass.")
     return 0
 
 
